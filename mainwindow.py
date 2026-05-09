@@ -170,8 +170,8 @@ class Ui_MainWindow(object):
         font.setBold(True)
         font.setWeight(75)
         self.spinBox.setFont(font)
-        self.spinBox.setMinimum(5)
-        self.spinBox.setMaximum(20)
+        self.spinBox.setMinimum(1)
+        self.spinBox.setMaximum(100)
         self.spinBox.setObjectName("spinBox")
         self.groupBox_4 = QtWidgets.QGroupBox(self.centralWidget)
         self.groupBox_4.setGeometry(QtCore.QRect(10, 0, 321, 301))
@@ -277,7 +277,7 @@ class Ui_MainWindow(object):
 
     def retranslateUi(self, MainWindow):
         _translate = QtCore.QCoreApplication.translate
-        MainWindow.setWindowTitle(_translate("MainWindow", "51UWB TWR Location Tool V0.8"))
+        MainWindow.setWindowTitle(_translate("MainWindow", "蓝点UWB-TWR 上位机V1.0"))
         self.tabWidget.setTabText(self.tabWidget.indexOf(self.tab), _translate("MainWindow", "定位"))
         self.btn_start.setText(_translate("MainWindow", "START"))
         self.btn_clear.setText(_translate("MainWindow", "CLEAR"))
@@ -286,7 +286,7 @@ class Ui_MainWindow(object):
         self.label.setText(_translate("MainWindow", "本机IP:"))
         self.label_ip.setText(_translate("MainWindow", "192.168.2.239"))
         self.label_2.setText(_translate("MainWindow", "端口Port:"))
-        self.lineEdit_Port.setText(_translate("MainWindow", "9000"))
+        self.lineEdit_Port.setText(_translate("MainWindow", "8888"))
         self.pushButton.setText(_translate("MainWindow", "OPEN"))
         self.label_port_state.setText(_translate("MainWindow", "TCP Status:端口没有打开！"))
         self.groupBox_3.setTitle(_translate("MainWindow", "定位结果"))

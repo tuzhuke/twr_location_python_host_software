@@ -1,0 +1,11 @@
+# Runtime dependencies for 蓝点UWB-TWR 上位机V1.0
+# Compatible with Windows, Linux, and macOS.
+# Python 3.7+ is supported; Python 3.9-3.11 is recommended for new installs.
+
+PyQt5>=5.15.4,<5.16
+pyserial>=3.5,<4
+
+# NumPy wheels have different Python-version support windows.
+numpy>=1.21.6,<1.22; python_version < "3.8"
+numpy>=1.24.4,<1.25; python_version >= "3.8" and python_version < "3.9"
+numpy>=1.26.4,<2.0; python_version >= "3.9"

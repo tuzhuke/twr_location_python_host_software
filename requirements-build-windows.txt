@@ -1,0 +1,6 @@
+-r requirements.txt
+
+# Build dependency used only on the packaging machine.
+# PyInstaller 5.x keeps Python 3.7 compatibility, which is important for
+# Windows 7 compatible builds.
+pyinstaller==5.13.2

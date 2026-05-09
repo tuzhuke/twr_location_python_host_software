@@ -103,8 +103,16 @@ def summarize(errors, x_errors, y_errors, failures, nlos_frames):
 
 def run(args):
     rng = random.Random(args.seed)
-    globalvar.set_anthor([dict(item) for item in DEFAULT_ANCHORS])
+    anchors = [dict(item) for item in DEFAULT_ANCHORS]
+    if args.anchor_count == 3:
+        anchors[3]["enable"] = 0
+    else:
+        anchors[3]["enable"] = 1
+    active_anchors = [item for item in anchors if item.get("enable") == 1]
+    globalvar.set_anthor(anchors)
     twr_main.LAST_LOCATION_RESULTS.clear()
+    if hasattr(twr_main, "LAST_LOCATION_TIMES"):
+        twr_main.LAST_LOCATION_TIMES.clear()
     twr_main.EKF_STATES.clear()
 
     packets = []
@@ -119,7 +127,7 @@ def run(args):
         position = true_position(index, args.count)
         distances, nlos_count = noisy_distances(
             position,
-            DEFAULT_ANCHORS,
+            active_anchors,
             rng,
             args.sigma,
             args.nlos_rate,
@@ -128,7 +136,10 @@ def run(args):
         )
         if nlos_count:
             nlos_frames += 1
-        packet = build_mr_packet(args.tag, index, distances)
+        packet_distances = list(distances)
+        if args.anchor_count == 3:
+            packet_distances.append(distances[0])
+        packet = build_mr_packet(args.tag, index, packet_distances)
         packets.append(packet)
 
         if args.verbose:
@@ -159,7 +170,7 @@ def run(args):
             "distance0": distances[0],
             "distance1": distances[1],
             "distance2": distances[2],
-            "distance3": distances[3],
+            "distance3": packet_distances[3],
             "calc_x": calc_x,
             "calc_y": calc_y,
             "calc_z": calc_z,
@@ -198,6 +209,7 @@ def run(args):
         "port": args.port,
         "noise_sigma_m": args.sigma,
         "nlos_rate": args.nlos_rate,
+        "anchor_count": args.anchor_count,
         "seed": args.seed,
         "csv_path": os.path.abspath(csv_path),
         "tcp_banner": banner.decode("utf-8", errors="ignore"),
@@ -209,8 +221,9 @@ def run(args):
 def main():
     parser = argparse.ArgumentParser(description="mr TCP positioning test client")
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=9000)
+    parser.add_argument("--port", type=int, default=8888)
     parser.add_argument("--count", type=int, default=5000)
+    parser.add_argument("--anchor-count", type=int, choices=(3, 4), default=4)
     parser.add_argument("--tag", type=int, default=0x33)
     parser.add_argument("--seed", type=int, default=20260509)
     parser.add_argument("--sigma", type=float, default=0.05)

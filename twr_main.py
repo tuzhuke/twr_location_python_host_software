@@ -2,8 +2,12 @@
 """
 UWB TWR packet parsing and 2D/3D positioning.
 
-Expected packet format:
-&&&:LEN$TAG:SEQ$ANCHOR_ID:DIST_CM:RSSI#...$CRC####
+This module is the transport-independent data pipeline. TCP, COM, tests, and
+debug parsing all enter here with one raw packet, then receive either a parsed
+distance snapshot or a final location result. The current algorithm path is:
+
+raw bytes/text -> protocol parser -> anchor coordinate mapping
+-> NLLS initial/final position -> per-tag EKF smoothing.
 """
 import re
 import time
@@ -12,6 +16,10 @@ import numpy as np
 
 import globalvar
 from Coordinate_process import BP_Process_String
+from uwb_logging import get_logger
+
+
+logger = get_logger(__name__)
 
 
 ALGORITHM_IDLE = "等待数据"
@@ -25,6 +33,7 @@ BINARY_HEADER = b"mr\x02"
 IMU_BINARY_PACKET_LEN = 18
 IMU_BINARY_HEADER = b"mri\x02"
 LAST_LOCATION_RESULTS = {}
+LAST_LOCATION_TIMES = {}
 
 # Stable display labels. The original file has historical mojibake strings; keep
 # the public variable names but rewrite them with Unicode escapes.
@@ -48,6 +57,8 @@ EKF_MAX_DT = 0.50
 EKF_PROCESS_NOISE_MPS2 = 1.40
 EKF_MIN_RANGE_SIGMA_M = 0.06
 EKF_MAX_RANGE_SIGMA_M = 0.90
+LOCATION_STATE_TTL_SECONDS = 120.0
+MAX_TRACKED_TAGS = 64
 EKF_STATES = {}
 
 
@@ -64,6 +75,7 @@ class TagRangeEKF:
         self.initialized = False
 
     def initialize(self, position, now=None):
+        """Initialize the EKF state from a position estimate."""
         now = time.monotonic() if now is None else now
         position = np.asarray(position, dtype=float)
         self.state[:] = 0.0
@@ -75,6 +87,7 @@ class TagRangeEKF:
         self.initialized = True
 
     def predict(self, now=None):
+        """Advance the constant-velocity model to ``now``."""
         if not self.initialized:
             return
 
@@ -104,6 +117,7 @@ class TagRangeEKF:
         self.last_time = now
 
     def update_ranges(self, anchors, distances, measurement_sigma):
+        """Apply nonlinear UWB range measurements to the EKF state."""
         anchors = np.asarray(anchors, dtype=float)[:, :self.dimensions]
         distances = np.asarray(distances, dtype=float)
         if len(anchors) != len(distances) or len(distances) < self.dimensions + 1:
@@ -135,75 +149,14 @@ class TagRangeEKF:
         self.cov = 0.5 * (self.cov + self.cov.T)
 
     def position_3d(self):
+        """Return the current position as an always-3D vector."""
         result = np.zeros(3, dtype=float)
         result[:self.dimensions] = self.state[:self.dimensions]
         return result
 
 
-class Trilateration:
-    def __init__(self):
-        self.position = np.empty((0, 3), dtype=float)
-        self.distances = []
-        self.result = np.array([0.0, 0.0, 0.0], dtype=float)
-
-    def _validate(self, dimensions):
-        positions = np.asarray(self.position, dtype=float)
-        distances = np.asarray(self.distances, dtype=float)
-
-        if positions.ndim != 2 or positions.shape[1] < dimensions:
-            raise ValueError("anchor coordinates must have at least %d dimensions" % dimensions)
-        if len(positions) != len(distances):
-            raise ValueError("anchor count and distance count do not match")
-        if len(distances) < dimensions + 1:
-            raise ValueError("at least %d anchors are required" % (dimensions + 1))
-        return positions[:, :dimensions], distances
-
-    def _solve(self, dimensions):
-        positions, distances = self._validate(dimensions)
-        ref = positions[0]
-        ref_distance = distances[0]
-        a_matrix = []
-        b_vector = []
-
-        for idx in range(1, len(distances)):
-            anchor = positions[idx]
-            a_matrix.append(2 * (anchor - ref))
-            b_vector.append(
-                ref_distance ** 2
-                - distances[idx] ** 2
-                + np.dot(anchor, anchor)
-                - np.dot(ref, ref)
-            )
-
-        a_matrix = np.asarray(a_matrix, dtype=float)
-        b_vector = np.asarray(b_vector, dtype=float)
-        if np.linalg.matrix_rank(a_matrix) < dimensions:
-            if dimensions == 2:
-                raise ValueError("anchor coordinates are collinear")
-            raise ValueError("anchor coordinates cannot resolve 3D position")
-
-        self.result, _, _, _ = np.linalg.lstsq(a_matrix, b_vector, rcond=None)
-        return self.result
-
-    def trilaterate2D(self):
-        result = self._solve(2)
-        return float(result[0]), float(result[1]), 0.0
-
-    def trilaterate3D(self):
-        result = self._solve(3)
-        return float(result[0]), float(result[1]), float(result[2])
-
-    def setDistances(self, distances):
-        self.distances = distances
-
-    def setAnthorCoor(self, Anthor_Node_Configure):
-        self.position = np.asarray(Anthor_Node_Configure, dtype=float)
-
-    def setAnchorCoor(self, Anchor_Node_Configure):
-        self.setAnthorCoor(Anchor_Node_Configure)
-
-
 def bphero_dispose(string):
+    """Parse the text protocol into the common distance dictionary."""
     result_dict = {'tag': 0, 'seq': 0, 'time': 0, 'anthor_count': 0, 'anthor': []}
     if not string:
         return 1, result_dict
@@ -251,17 +204,18 @@ def bphero_dispose(string):
             anthor_id = int(anchor_parts[0], 16)
             anthor_dist = 0.01 * int(anchor_parts[1], 16)
             anthor_rssi = int(anchor_parts[2], 16)
-            print("Anthor%d Distance = %0.2f m" % (index + 1, anthor_dist))
+            logger.debug("Anthor%d Distance = %0.2f m", index + 1, anthor_dist)
             result_dict['anthor'].append([anthor_id, anthor_dist, anthor_rssi])
 
         result_dict['anthor_count'] = len(result_dict['anthor'])
         return 0, result_dict
     except (TypeError, ValueError, IndexError) as exc:
-        print("Parse packet failed: %s" % exc)
+        logger.warning("Parse packet failed: %s", exc)
         return 1, result_dict
 
 
 def get_binary_anchor_ids(anchor_count):
+    """Bind binary distance slots to currently enabled anchor addresses."""
     enabled = [item for item in globalvar.get_anthor() if item.get("enable") == 1]
     source = enabled if len(enabled) >= anchor_count else globalvar.get_anthor()
     anchor_ids = [item["short_address"] for item in source[:anchor_count]]
@@ -270,7 +224,40 @@ def get_binary_anchor_ids(anchor_count):
     return anchor_ids
 
 
+def infer_binary_anchor_count(raw_distances):
+    """Infer 3/4-anchor binary packet mode from the frame, then config.
+
+    The binary ``mr/mri`` protocols do not carry an explicit anchor-count field.
+    In the 3-anchor wire format the fourth distance slot repeats Dis0, so that
+    frame must expose only the first three anchors to positioning and drawing.
+    """
+    if len(raw_distances) >= 4 and raw_distances[3] == raw_distances[0]:
+        return 3
+
+    enabled_count = len([item for item in globalvar.get_anthor() if item.get("enable") == 1])
+    if enabled_count >= 4:
+        return 4
+    if enabled_count == 3:
+        return 3
+    return 4
+
+
+PACKET_HEADERS = (IMU_BINARY_HEADER, BINARY_HEADER, b"&&&:")
+
+
+def preserve_trailing_header_prefix(buffer):
+    """Keep a trailing partial frame header for the next TCP/COM read."""
+    max_prefix_len = max(len(header) for header in PACKET_HEADERS) - 1
+    max_prefix_len = min(max_prefix_len, len(buffer))
+    for size in range(max_prefix_len, 0, -1):
+        suffix = buffer[-size:]
+        if any(header.startswith(suffix) for header in PACKET_HEADERS):
+            return suffix
+    return b""
+
+
 def binary_dispose(packet):
+    """Parse the 16-byte ``mr`` UWB distance protocol."""
     result_dict = {'tag': 0, 'seq': 0, 'time': 0, 'anthor_count': 0, 'anthor': []}
     if isinstance(packet, str):
         packet = packet.encode("latin1", errors="ignore")
@@ -285,7 +272,7 @@ def binary_dispose(packet):
     for offset in (6, 8, 10, 12):
         raw_distances.append(packet[offset] | (packet[offset + 1] << 8))
 
-    anchor_count = 3 if raw_distances[3] == raw_distances[0] else 4
+    anchor_count = infer_binary_anchor_count(raw_distances)
     anchor_ids = get_binary_anchor_ids(anchor_count)
 
     result_dict['tag'] = tag_id
@@ -294,12 +281,13 @@ def binary_dispose(packet):
     for index in range(anchor_count):
         distance_m = raw_distances[index] * 0.01
         result_dict['anthor'].append([anchor_ids[index], distance_m, 0])
-        print("Binary Anthor%d Distance = %0.2f m" % (index + 1, distance_m))
+        logger.debug("Binary Anthor%d Distance = %0.2f m", index + 1, distance_m)
 
     return 0, result_dict
 
 
 def imu_binary_dispose(packet):
+    """Parse the 18-byte ``mri`` UWB+IMU protocol."""
     result_dict = {
         'tag': 0,
         'seq': 0,
@@ -325,7 +313,7 @@ def imu_binary_dispose(packet):
     if motion_byte not in (ord("s"), ord("m")):
         return 1, result_dict
 
-    anchor_count = 3 if raw_distances[3] == raw_distances[0] else 4
+    anchor_count = infer_binary_anchor_count(raw_distances)
     anchor_ids = get_binary_anchor_ids(anchor_count)
 
     result_dict['tag'] = tag_id
@@ -335,12 +323,13 @@ def imu_binary_dispose(packet):
     for index in range(anchor_count):
         distance_m = raw_distances[index] * 0.01
         result_dict['anthor'].append([anchor_ids[index], distance_m, 0])
-        print("IMU Binary Anthor%d Distance = %0.2f m" % (index + 1, distance_m))
+        logger.debug("IMU Binary Anthor%d Distance = %0.2f m", index + 1, distance_m)
 
     return 0, result_dict
 
 
 def extract_packets(buffer):
+    """Extract complete packets from a streaming TCP/COM byte buffer."""
     if isinstance(buffer, str):
         buffer = buffer.encode("latin1", errors="ignore")
 
@@ -351,7 +340,7 @@ def extract_packets(buffer):
         imu_start = buffer.find(IMU_BINARY_HEADER)
         starts = [idx for idx in (text_start, binary_start, imu_start) if idx >= 0]
         if not starts:
-            return packets, b""
+            return packets, preserve_trailing_header_prefix(buffer)
 
         start = min(starts)
         if start > 0:
@@ -396,62 +385,8 @@ def extract_packets(buffer):
     return packets, b""
 
 
-def select_location_algorithm(info):
-    count = info['count']
-    anchors = np.asarray(info['anthor'], dtype=float)
-
-    if count == 3:
-        return ALGORITHM_2D_3_ANCHOR
-    if count == 4:
-        if np.allclose(anchors[:, 2], anchors[0, 2]):
-            return ALGORITHM_2D_4_ANCHOR
-        return ALGORITHM_3D_4_ANCHOR
-    if count > 4:
-        if np.allclose(anchors[:, 2], anchors[0, 2]):
-            return "多基站二维定位"
-        return "多基站三维定位"
-    return ALGORITHM_IDLE
-
-
-def Compute_Location(Input_Data):
-    motion_state = Input_Data.get('motion_state') if isinstance(Input_Data, dict) else None
-    if motion_state == 's':
-        tag = Input_Data.get('tag', 0)
-        seq = Input_Data.get('seq', 0)
-        last_result = LAST_LOCATION_RESULTS.get(tag)
-        if last_result is None:
-            return 0, seq, tag, 0, 0, 0, ALGORITHM_IMU_NO_LAST
-        result_x, result_y, result_z, _ = last_result
-        print("%s: tag=%d x = %0.2f, y = %0.2f, z = %0.2f" % (
-            ALGORITHM_IMU_HOLD, tag, result_x, result_y, result_z
-        ))
-        return 1, seq, tag, result_x, result_y, result_z, ALGORITHM_IMU_HOLD
-
-    info = BP_Process_String(Input_Data)
-    print(info)
-    if info['count'] < 3:
-        return 0, info['seq'], info['tag'], 0, 0, 0, ALGORITHM_IDLE
-
-    algorithm = select_location_algorithm(info)
-
-    try:
-        tril = Trilateration()
-        tril.setDistances(info['distance'])
-        tril.setAnthorCoor(info['anthor'])
-        if algorithm in (ALGORITHM_3D_4_ANCHOR, "多基站三维定位"):
-            result_x, result_y, result_z = tril.trilaterate3D()
-        else:
-            result_x, result_y, result_z = tril.trilaterate2D()
-
-        print("%s: x = %0.2f, y = %0.2f, z = %0.2f" % (algorithm, result_x, result_y, result_z))
-        LAST_LOCATION_RESULTS[info['tag']] = (result_x, result_y, result_z, algorithm)
-        return 1, info['seq'], info['tag'], result_x, result_y, result_z, algorithm
-    except ValueError as exc:
-        print("Compute location failed: %s" % exc)
-        return 0, info['seq'], info['tag'], 0, 0, 0, algorithm + "失败"
-
-
 def _location_mode(info):
+    """Choose 2D/3D and status label from available anchor geometry."""
     count = int(info.get('count', 0))
     anchors = np.asarray(info.get('anthor', []), dtype=float)
     if count < 3 or anchors.ndim != 2 or anchors.shape[1] < 3:
@@ -488,6 +423,7 @@ def _solver_arrays(info, dimensions):
 
 
 def _linear_position(anchors, distances, dimensions):
+    """Compute the linear least-squares position used as the NLLS initial value."""
     anchors = np.asarray(anchors, dtype=float)[:, :dimensions]
     distances = np.asarray(distances, dtype=float)
     ref = anchors[0]
@@ -534,6 +470,7 @@ def _residual_metrics(position, anchors, distances, dimensions):
 
 
 def _nlls_position(anchors, distances, dimensions, initial=None):
+    """Refine position with damped Gauss-Newton nonlinear least squares."""
     anchors = np.asarray(anchors, dtype=float)[:, :dimensions]
     distances = np.asarray(distances, dtype=float)
     if initial is None:
@@ -620,6 +557,41 @@ def _get_tag_filter(tag, dimensions, initial_position, now):
     return ekf, False
 
 
+def cleanup_location_state(now=None):
+    """Bound per-tag EKF/history memory with TTL and maximum tag count."""
+    now = time.monotonic() if now is None else now
+    tags = set(EKF_STATES) | set(LAST_LOCATION_RESULTS) | set(LAST_LOCATION_TIMES)
+
+    for tag in list(tags):
+        ekf = EKF_STATES.get(tag)
+        last_seen = LAST_LOCATION_TIMES.get(tag)
+        if last_seen is None and ekf is not None:
+            last_seen = ekf.last_time
+        if last_seen is None or now - last_seen > LOCATION_STATE_TTL_SECONDS:
+            EKF_STATES.pop(tag, None)
+            LAST_LOCATION_RESULTS.pop(tag, None)
+            LAST_LOCATION_TIMES.pop(tag, None)
+
+    tags = set(EKF_STATES) | set(LAST_LOCATION_RESULTS) | set(LAST_LOCATION_TIMES)
+    if len(tags) <= MAX_TRACKED_TAGS:
+        return
+
+    def last_seen_time(tag):
+        """Return the best known activity timestamp for tag cleanup ordering."""
+        ekf = EKF_STATES.get(tag)
+        if tag in LAST_LOCATION_TIMES:
+            return LAST_LOCATION_TIMES[tag]
+        if ekf is not None and ekf.last_time is not None:
+            return ekf.last_time
+        return 0.0
+
+    remove_count = len(tags) - MAX_TRACKED_TAGS
+    for tag in sorted(tags, key=last_seen_time)[:remove_count]:
+        EKF_STATES.pop(tag, None)
+        LAST_LOCATION_RESULTS.pop(tag, None)
+        LAST_LOCATION_TIMES.pop(tag, None)
+
+
 def _status_text(algorithm, rms, suffix="NLLS+EKF"):
     return "%s %s RMS:%0.2fm \u8d28\u91cf:%s" % (
         algorithm,
@@ -630,9 +602,12 @@ def _status_text(algorithm, rms, suffix="NLLS+EKF"):
 
 
 def Compute_Location(Input_Data):
+    """Compute one tag location from a parsed protocol dictionary."""
     motion_state = Input_Data.get('motion_state') if isinstance(Input_Data, dict) else None
     tag = Input_Data.get('tag', 0) if isinstance(Input_Data, dict) else 0
     seq = Input_Data.get('seq', 0) if isinstance(Input_Data, dict) else 0
+    now = time.monotonic()
+    cleanup_location_state(now)
 
     if motion_state == 's':
         ekf = EKF_STATES.get(tag)
@@ -640,6 +615,7 @@ def Compute_Location(Input_Data):
         if ekf is not None and ekf.initialized:
             position = ekf.position_3d()
             result_x, result_y, result_z = position
+            ekf.last_time = now
         elif last_result is not None:
             result_x, result_y, result_z, _ = last_result
         else:
@@ -647,13 +623,19 @@ def Compute_Location(Input_Data):
 
         status = "%s" % ALGORITHM_IMU_HOLD
         LAST_LOCATION_RESULTS[tag] = (result_x, result_y, result_z, status)
-        print("%s: tag=%d x = %0.2f, y = %0.2f, z = %0.2f" % (
-            status, tag, result_x, result_y, result_z
-        ))
+        LAST_LOCATION_TIMES[tag] = now
+        logger.debug(
+            "%s: tag=%d x = %0.2f, y = %0.2f, z = %0.2f",
+            status,
+            tag,
+            result_x,
+            result_y,
+            result_z,
+        )
         return 1, seq, tag, result_x, result_y, result_z, status
 
     info = BP_Process_String(Input_Data)
-    print(info)
+    logger.debug("location input=%s", info)
     if info['count'] < 3:
         return 0, info['seq'], info['tag'], 0, 0, 0, ALGORITHM_IDLE
 
@@ -667,7 +649,6 @@ def Compute_Location(Input_Data):
         nlls_position = _nlls_position(anchors, distances, dimensions, linear_position)
         nlls_rms, _ = _residual_metrics(nlls_position, anchors, distances, dimensions)
 
-        now = time.monotonic()
         ekf, initialized = _get_tag_filter(info['tag'], dimensions, nlls_position, now)
         if not initialized:
             ekf.predict(now)
@@ -679,14 +660,16 @@ def Compute_Location(Input_Data):
         result_x, result_y, result_z = [float(value) for value in filtered_position]
         status = _status_text(algorithm, nlls_rms)
         LAST_LOCATION_RESULTS[info['tag']] = (result_x, result_y, result_z, status)
-        print("%s: x = %0.2f, y = %0.2f, z = %0.2f" % (status, result_x, result_y, result_z))
+        LAST_LOCATION_TIMES[info['tag']] = now
+        logger.debug("%s: x = %0.2f, y = %0.2f, z = %0.2f", status, result_x, result_y, result_z)
         return 1, info['seq'], info['tag'], result_x, result_y, result_z, status
     except ValueError as exc:
-        print("Compute location failed: %s" % exc)
+        logger.warning("Compute location failed: %s", exc)
         return 0, info['seq'], info['tag'], 0, 0, 0, algorithm + "\u5931\u8d25"
 
 
 def Process_String_Before_Udp(NewString):
+    """Parse one complete packet into the common distance dictionary."""
     if isinstance(NewString, (bytes, bytearray)):
         data = bytes(NewString)
         if data.startswith(IMU_BINARY_HEADER):
@@ -701,7 +684,8 @@ def Process_String_Before_Udp(NewString):
 
 
 def twr_main(input_string):
-    print(input_string)
+    """Main one-packet entry point used by TCP, COM, and tests."""
+    logger.debug("raw packet=%r", input_string)
     error_flag, result_dic = Process_String_Before_Udp(input_string)
     if error_flag == 0:
         return Compute_Location(result_dic)

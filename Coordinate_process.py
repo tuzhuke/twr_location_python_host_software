@@ -5,9 +5,14 @@ Anchor coordinate lookup and packet-to-position input conversion.
 import time
 
 import globalvar
+from uwb_logging import get_logger
+
+
+logger = get_logger(__name__)
 
 
 def _parse_address(address):
+    """Accept integer, decimal string, or hex string anchor addresses."""
     if isinstance(address, str):
         text = address.strip()
         try:
@@ -18,6 +23,7 @@ def _parse_address(address):
 
 
 def Find_Anthor_Coor(Athor_Addr):
+    """Find enabled anchor coordinates and refresh its last-seen timestamp."""
     try:
         anchor_address = _parse_address(Athor_Addr)
     except (TypeError, ValueError):
@@ -31,6 +37,7 @@ def Find_Anthor_Coor(Athor_Addr):
 
 
 def Anthor_Coordinate_Process(Anthor_info):
+    """Convert parsed anchor ranges to coordinate, distance, and RSSI lists."""
     coordinate_list = []
     distance_list = []
     rssi_list = []
@@ -51,6 +58,7 @@ def Anthor_Coordinate_Process(Anthor_info):
 
 
 def BP_Process_String(Input_String):
+    """Build the normalized solver input consumed by ``twr_main.Compute_Location``."""
     new_dict = {"tag": 0, "seq": 0, "count": 0, "anthor": [], "distance": [], "Rssi": []}
     if not isinstance(Input_String, dict):
         return new_dict
@@ -61,7 +69,7 @@ def BP_Process_String(Input_String):
     anthor_info = Input_String.get("anthor", [])
     anthor_flag, coor_address, dist_stamp, rssi_list = Anthor_Coordinate_Process(anthor_info)
     if anthor_flag == 0:
-        print("Error! Could Not Find ANTHOR Node Address !!")
+        logger.warning("Could not find anchor node address")
         return new_dict
 
     for index, coordinate in enumerate(coor_address):

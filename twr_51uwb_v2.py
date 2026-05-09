@@ -146,6 +146,8 @@ class HuiTu(UILayoutMixin, DebugPanelMixin, PlotMixin, QtWidgets.QMainWindow, Ui
         self.scene_label_font.setBold(True)
         self.MAX_HISTORY = self.persistent_config["display"]["history_count"]
         self.gTag_Result = []
+        self.tag_result_by_address = {}
+        self.pending_location_results = {}
         self.measurement_overlay_items = []
         self.measurement_overlay_by_tag = {}
         self.measurement_aid_enabled = self.persistent_config["display"]["measurement_aid_enabled"]
@@ -212,6 +214,9 @@ class HuiTu(UILayoutMixin, DebugPanelMixin, PlotMixin, QtWidgets.QMainWindow, Ui
         self.anchor_timer = QtCore.QTimer(self)
         self.anchor_timer.timeout.connect(self.refresh_anthor_status)
         self.anchor_timer.start(2000)
+        self.location_result_flush_timer = QtCore.QTimer(self)
+        self.location_result_flush_timer.timeout.connect(self.flush_location_results)
+        self.location_result_flush_timer.start(33)
         self.refresh_serial_ports()
 
     def apply_loaded_anchor_config(self):

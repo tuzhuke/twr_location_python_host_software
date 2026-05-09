@@ -8,6 +8,7 @@ readable.
 """
 import math
 import time
+from collections import deque
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.Qt import Qt
@@ -122,6 +123,13 @@ class PlotMixin:
             )
         self.refresh_location_measurement_overlay_throttled(force=True)
 
+    def reset_tag_results(self):
+        """Clear all cached tag state after a scene/configuration reset."""
+        self.gTag_Result = []
+        self.tag_result_by_address = {}
+        if hasattr(self, "pending_location_results"):
+            self.pending_location_results.clear()
+
     def redraw_scene_keep_tags(self):
         """Redraw anchors/grid while preserving the latest visible tag positions."""
         existing_tags = []
@@ -131,7 +139,7 @@ class PlotMixin:
                 existing_tags.append((item["short_address"], {"x": last["x"], "y": last["y"], "z": last["z"]}))
         self.scene.clear()
         self.Display_Anthor(globalvar.get_anthor())
-        self.gTag_Result = []
+        self.reset_tag_results()
         self.table_tag.clearContents()
         for short_address, coor_info in existing_tags:
             self.Insert_Tag_Result(short_address, coor_info)
@@ -374,7 +382,7 @@ class PlotMixin:
         gAnthor_Node_Configure[row]["enable"] = 1 if state == Qt.Checked else 0
         globalvar.set_anthor(gAnthor_Node_Configure)
         self.scene.clear()
-        self.gTag_Result = []
+        self.reset_tag_results()
         self.Display_Anthor(gAnthor_Node_Configure)
 
     def Remove_Tag_Pic(self, item):
@@ -391,36 +399,80 @@ class PlotMixin:
             pass
 
     def Show_Tag_Pic(self, item, point_x, point_y, point_z, color_index):
-        """Update or create a tag marker and its trail on the main canvas."""
+        """Update persistent tag marker/trail items instead of creating per-frame items."""
         marker = self.tag_marker_size
-        qitem = QGraphicsEllipseItem(-marker / 2, -marker / 2, marker, marker)
         ground_x, ground_y = self.map_scene_point(point_x, point_y, 0)
         scene_x, scene_y = self.map_scene_point(point_x, point_y, point_z)
         color = self.gQtColor[color_index % len(self.gQtColor)]
+
+        trail = item.get("qt_trail")
+        if trail is None:
+            trail_pen = QPen(QColor(color))
+            trail_pen.setWidthF(1.8)
+            trail_pen.setStyle(Qt.SolidLine)
+            trail = self.scene.addPath(QtGui.QPainterPath(), trail_pen)
+            trail.setZValue(4)
+            item["qt_trail"] = trail
+        else:
+            trail_pen = QPen(QColor(color))
+            trail_pen.setWidthF(1.8)
+            trail.setPen(trail_pen)
+
+        path = QtGui.QPainterPath()
+        for index, history_point in enumerate(item["result"]):
+            history_x, history_y = self.map_scene_point(
+                history_point["x"],
+                history_point["y"],
+                history_point.get("z", 0),
+            )
+            if index == 0:
+                path.moveTo(history_x, history_y)
+            else:
+                path.lineTo(history_x, history_y)
+        trail.setPath(path)
+        trail.setVisible(len(item["result"]) > 1)
+
+        qitem = item.get("qt")
+        if qitem is None:
+            qitem = QGraphicsEllipseItem(-marker / 2, -marker / 2, marker, marker)
+            qitem.setZValue(8)
+            self.scene.addItem(qitem)
+            item["qt"] = qitem
+        qitem.setRect(-marker / 2, -marker / 2, marker, marker)
         qitem.setBrush(QBrush(color))
         qitem.setPen(QPen(QColor("#FFFFFF"), 1.8))
         qitem.setPos(scene_x, scene_y)
-        qt_items = []
+
         if self.display_mode == "3D":
-            stem = QGraphicsLineItem(ground_x, ground_y, scene_x, scene_y)
+            stem = item.get("qt_stem")
+            if stem is None:
+                stem = QGraphicsLineItem()
+                stem.setZValue(5)
+                self.scene.addItem(stem)
+                item["qt_stem"] = stem
             stem_pen = QPen(color)
             stem_pen.setWidthF(2.0)
             stem_pen.setStyle(Qt.DashLine)
             stem.setPen(stem_pen)
-            self.scene.addItem(stem)
-            qt_items.append(stem)
+            stem.setLine(ground_x, ground_y, scene_x, scene_y)
+            stem.setVisible(True)
 
-            height_label = self.scene.addText("z:%0.2f" % point_z)
+            height_label = item.get("qt_height_label")
+            if height_label is None:
+                height_label = self.scene.addText("")
+                height_label.setFlag(QtWidgets.QGraphicsItem.ItemIgnoresTransformations, True)
+                height_label.setZValue(9)
+                item["qt_height_label"] = height_label
+            height_label.setPlainText("z:%0.2f" % point_z)
             height_label.setFont(self.scene_label_font)
             height_label.setDefaultTextColor(color)
-            height_label.setFlag(QtWidgets.QGraphicsItem.ItemIgnoresTransformations, True)
             height_label.setPos(scene_x + marker / 2 + 8, scene_y - marker / 2 - 10)
-            qt_items.append(height_label)
-
-        self.scene.addItem(qitem)
-        qt_items.append(qitem)
-        item["qt"] = qitem
-        item["qt_items"] = qt_items
+            height_label.setVisible(True)
+        else:
+            for optional_key in ("qt_stem", "qt_height_label"):
+                optional_item = item.get(optional_key)
+                if optional_item is not None:
+                    optional_item.setVisible(False)
 
     def show_tag_result(self, shortaddress, avg_x, avg_y, avg_z, index):
         """Update one row in the location result table."""
@@ -438,37 +490,44 @@ class PlotMixin:
 
     def Insert_Tag_Result(self, short_address, coor_info):
         """Insert one positioning result into history, table, and canvas."""
-        tag_entry = None
-        tag_index = 0
-        for index, item in enumerate(self.gTag_Result):
-            if item["short_address"] == short_address:
-                tag_entry = item
-                tag_index = index
-                break
+        if not hasattr(self, "tag_result_by_address"):
+            self.tag_result_by_address = {}
+        tag_entry = self.tag_result_by_address.get(short_address)
 
         if tag_entry is None:
             tag_index = len(self.gTag_Result)
-            tag_entry = {"short_address": short_address, "result": []}
+            tag_entry = {
+                "short_address": short_address,
+                "result": deque(),
+                "index": tag_index,
+                "sum_x": 0.0,
+                "sum_y": 0.0,
+                "sum_z": 0.0,
+            }
             self.gTag_Result.append(tag_entry)
+            self.tag_result_by_address[short_address] = tag_entry
+        else:
+            tag_index = tag_entry.get("index", self.gTag_Result.index(tag_entry))
 
         history = tag_entry["result"]
         while len(history) >= self.MAX_HISTORY:
-            self.Remove_Tag_Pic(history[0].get("qt_items", history[0].get("qt")))
-            del history[0]
+            old_point = history.popleft()
+            tag_entry["sum_x"] -= old_point["x"]
+            tag_entry["sum_y"] -= old_point["y"]
+            tag_entry["sum_z"] -= old_point["z"]
 
-        point = {"x": coor_info["x"], "y": coor_info["y"], "z": coor_info.get("z", 0), "qt": None}
+        point = {"x": coor_info["x"], "y": coor_info["y"], "z": coor_info.get("z", 0)}
         history.append(point)
+        tag_entry["sum_x"] += point["x"]
+        tag_entry["sum_y"] += point["y"]
+        tag_entry["sum_z"] += point["z"]
 
-        avg_x = sum(item["x"] for item in history) / len(history)
-        avg_y = sum(item["y"] for item in history) / len(history)
-        avg_z = sum(item["z"] for item in history) / len(history)
+        history_len = max(1, len(history))
+        avg_x = tag_entry["sum_x"] / history_len
+        avg_y = tag_entry["sum_y"] / history_len
+        avg_z = tag_entry["sum_z"] / history_len
 
-        self.Show_Tag_Pic(point, avg_x, avg_y, avg_z, tag_index)
-        for index, item in enumerate(history):
-            opacity = (index + 1) / len(history)
-            for qt_item in item.get("qt_items", [item.get("qt")]):
-                if qt_item is not None:
-                    qt_item.setOpacity(opacity)
+        self.Show_Tag_Pic(tag_entry, avg_x, avg_y, avg_z, tag_index)
 
         self.show_tag_result(short_address, avg_x, avg_y, avg_z, tag_index)
 
@@ -511,7 +570,7 @@ class PlotMixin:
 
         globalvar.set_anthor(gAnthor_Node_Configure)
         self.scene.clear()
-        self.gTag_Result = []
+        self.reset_tag_results()
         self.Display_Anthor(gAnthor_Node_Configure)
 
     def refresh_anthor_status(self):
@@ -526,9 +585,35 @@ class PlotMixin:
                 qitem.setBrush(QBrush(QColor("#155F8C")))
 
     def insert_result(self, input_value):
-        """Receive one located tag result from TCP/COM services."""
+        """Queue one or many located tag results for the fixed-rate GUI flusher."""
+        if isinstance(input_value, list):
+            for item in input_value:
+                self.insert_result(item)
+            return
+
         location_seq, location_addr, location_x, location_y, location_z, algorithm = input_value
-        logger.debug("insert result seq=%d addr=%d algorithm=%s", location_seq, location_addr, algorithm)
+        logger.debug("queue result seq=%d addr=%d algorithm=%s", location_seq, location_addr, algorithm)
         self.set_algorithm_status(algorithm)
-        self.Insert_Tag_Result(location_addr, {"x": location_x, "y": location_y, "z": location_z})
+        if not hasattr(self, "pending_location_results"):
+            self.pending_location_results = {}
+        self.pending_location_results[location_addr] = (
+            location_seq,
+            location_addr,
+            location_x,
+            location_y,
+            location_z,
+            algorithm,
+        )
+
+    def flush_location_results(self):
+        """Render the latest queued point per tag at display frame rate."""
+        pending = getattr(self, "pending_location_results", None)
+        if not pending:
+            return
+
+        results = list(pending.values())
+        pending.clear()
+        for location_seq, location_addr, location_x, location_y, location_z, algorithm in results:
+            logger.debug("insert result seq=%d addr=%d algorithm=%s", location_seq, location_addr, algorithm)
+            self.Insert_Tag_Result(location_addr, {"x": location_x, "y": location_y, "z": location_z})
 

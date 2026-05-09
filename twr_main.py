@@ -60,6 +60,10 @@ EKF_MAX_RANGE_SIGMA_M = 0.90
 LOCATION_STATE_TTL_SECONDS = 120.0
 MAX_TRACKED_TAGS = 64
 EKF_STATES = {}
+LOCATION_CLEANUP_INTERVAL_SECONDS = 2.0
+LOCATION_CLEANUP_PACKET_INTERVAL = 128
+_last_location_cleanup_time = 0.0
+_location_cleanup_packet_count = 0
 
 
 class TagRangeEKF:
@@ -592,6 +596,23 @@ def cleanup_location_state(now=None):
         LAST_LOCATION_TIMES.pop(tag, None)
 
 
+def cleanup_location_state_throttled(now=None):
+    """Run tag-state cleanup periodically instead of on every packet."""
+    global _last_location_cleanup_time, _location_cleanup_packet_count
+
+    now = time.monotonic() if now is None else now
+    _location_cleanup_packet_count += 1
+    if (
+        now - _last_location_cleanup_time < LOCATION_CLEANUP_INTERVAL_SECONDS
+        and _location_cleanup_packet_count < LOCATION_CLEANUP_PACKET_INTERVAL
+    ):
+        return
+
+    cleanup_location_state(now)
+    _last_location_cleanup_time = now
+    _location_cleanup_packet_count = 0
+
+
 def _status_text(algorithm, rms, suffix="NLLS+EKF"):
     return "%s %s RMS:%0.2fm \u8d28\u91cf:%s" % (
         algorithm,
@@ -607,7 +628,7 @@ def Compute_Location(Input_Data):
     tag = Input_Data.get('tag', 0) if isinstance(Input_Data, dict) else 0
     seq = Input_Data.get('seq', 0) if isinstance(Input_Data, dict) else 0
     now = time.monotonic()
-    cleanup_location_state(now)
+    cleanup_location_state_throttled(now)
 
     if motion_state == 's':
         ekf = EKF_STATES.get(tag)

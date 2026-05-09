@@ -11,6 +11,7 @@ import datetime
 import math
 import os
 import time
+from collections import deque
 
 from PyQt5 import QtCore, QtWidgets
 from PyQt5.Qt import Qt
@@ -26,6 +27,7 @@ DEBUG_UI_LOG_FLUSH_MAX_LINES = 80
 DEBUG_UI_LOG_PENDING_MAX_LINES = 1000
 DEBUG_FILE_LOG_FLUSH_BATCH = 64
 DEBUG_RAW_LINE_IDLE_FLUSH_S = 0.45
+DEBUG_PARSE_REFRESH_INTERVAL_MS = 100
 
 
 class DebugPanelMixin:
@@ -43,10 +45,17 @@ class DebugPanelMixin:
         self.pending_file_log_lines = []
         self.visible_raw_log_fragment = ""
         self.visible_raw_log_fragment_time = 0.0
+        self.debug_tag_combo_tags = ()
+        self.debug_tag_combo_dirty = True
+        self.debug_tag_combo_preferred = None
+        self.debug_parse_view_dirty = False
         self.edit_log.setMaximumBlockCount(DEBUG_VISIBLE_LOG_MAX_LINES)
         self.debug_log_flush_timer = QtCore.QTimer(self)
         self.debug_log_flush_timer.timeout.connect(self.flush_debug_logs)
         self.debug_log_flush_timer.start(DEBUG_UI_LOG_FLUSH_INTERVAL_MS)
+        self.debug_parse_refresh_timer = QtCore.QTimer(self)
+        self.debug_parse_refresh_timer.timeout.connect(self.flush_debug_parse_refresh)
+        self.debug_parse_refresh_timer.start(DEBUG_PARSE_REFRESH_INTERVAL_MS)
 
     def flush_debug_logs(self):
         """Flush visible and file logs in small batches to keep the UI responsive."""
@@ -220,6 +229,28 @@ class DebugPanelMixin:
             self.refresh_debug_tag_combo()
             self.refresh_debug_parse_view()
 
+    def mark_debug_parse_refresh(self, preferred_tag=None, tag_set_changed=False):
+        """Request one throttled refresh of debug parse widgets."""
+        if tag_set_changed:
+            self.debug_tag_combo_dirty = True
+        if preferred_tag is not None:
+            self.debug_tag_combo_preferred = preferred_tag
+        self.debug_parse_view_dirty = True
+
+    def flush_debug_parse_refresh(self):
+        """Refresh debug parse widgets at a fixed UI rate during data bursts."""
+        if not self.debug_parse_enabled:
+            return
+
+        if self.debug_tag_combo_dirty:
+            self.refresh_debug_tag_combo(preferred_tag=self.debug_tag_combo_preferred)
+            self.debug_tag_combo_dirty = False
+            self.debug_tag_combo_preferred = None
+
+        if self.debug_parse_view_dirty:
+            self.debug_parse_view_dirty = False
+            self.refresh_debug_parse_view()
+
     @staticmethod
     def format_motion_state(motion_state):
         """Return a display string for IMU motion state."""
@@ -239,11 +270,18 @@ class DebugPanelMixin:
 
     def clear_measurement_overlay(self, tag=None):
         """Remove all measurement overlay items or only one tag group."""
+        def group_items(group):
+            if isinstance(group, dict):
+                return list(group.values())
+            return list(group)
+
         if tag is None:
-            items = list(getattr(self, "measurement_overlay_items", []))
+            items = []
+            for group in getattr(self, "measurement_overlay_by_tag", {}).values():
+                items.extend(group_items(group))
             self.measurement_overlay_by_tag = {}
         else:
-            items = list(getattr(self, "measurement_overlay_by_tag", {}).pop(tag, []))
+            items = group_items(getattr(self, "measurement_overlay_by_tag", {}).pop(tag, {}))
 
         for item in items:
             try:
@@ -265,16 +303,42 @@ class DebugPanelMixin:
         if z_value is not None:
             item.setZValue(z_value)
         self.measurement_overlay_items.append(item)
-        if tag is not None:
+        if tag is not None and not isinstance(self.measurement_overlay_by_tag.get(tag), dict):
             self.measurement_overlay_by_tag.setdefault(tag, []).append(item)
         return item
+
+    def get_measurement_overlay_item(self, tag, key, factory, z_value):
+        """Return a persistent overlay item for ``tag`` and ``key``."""
+        group = self.measurement_overlay_by_tag.setdefault(tag, {})
+        if not isinstance(group, dict):
+            self.clear_measurement_overlay(tag)
+            group = self.measurement_overlay_by_tag.setdefault(tag, {})
+
+        item = group.get(key)
+        if item is None:
+            item = factory()
+            item.setZValue(z_value)
+            group[key] = item
+            self.measurement_overlay_items.append(item)
+        item.setVisible(True)
+        return item
+
+    def hide_unused_measurement_overlay_items(self, tag, used_keys):
+        """Hide stale overlay items that were not touched in the current refresh."""
+        group = self.measurement_overlay_by_tag.get(tag, {})
+        if not isinstance(group, dict):
+            return
+        for key, item in group.items():
+            if key not in used_keys:
+                item.setVisible(False)
 
     def cleanup_debug_parse_data(self, now=None):
         """Drop stale or excess tag parse snapshots and their scene overlays."""
         if not self.debug_parse_data:
-            return
+            return False
 
         now = time.time() if now is None else now
+        removed = False
         stale_tags = [
             tag for tag, info in self.debug_parse_data.items()
             if now - float(info.get("timestamp", 0.0)) > self.debug_parse_ttl_seconds
@@ -283,9 +347,10 @@ class DebugPanelMixin:
             self.debug_parse_data.pop(tag, None)
             self.debug_distance_history.pop(tag, None)
             self.clear_measurement_overlay(tag)
+            removed = True
 
         if len(self.debug_parse_data) <= self.max_debug_tags:
-            return
+            return removed
 
         sorted_tags = sorted(
             self.debug_parse_data,
@@ -295,6 +360,8 @@ class DebugPanelMixin:
             self.debug_parse_data.pop(tag, None)
             self.debug_distance_history.pop(tag, None)
             self.clear_measurement_overlay(tag)
+            removed = True
+        return removed
 
     def append_debug_distance_history(self, tag, parse_info, now):
         """Append parsed anchor distances to the selected tag's trend history."""
@@ -308,18 +375,24 @@ class DebugPanelMixin:
             except (TypeError, ValueError, IndexError):
                 continue
             rssi = anchor[2] if len(anchor) > 2 else 0
-            series = tag_history.setdefault(anchor_address, [])
+            series = tag_history.setdefault(anchor_address, deque())
+            if not isinstance(series, deque):
+                series = deque(series)
+                tag_history[anchor_address] = series
             series.append({
                 "time": now,
                 "distance": distance,
                 "rssi": rssi,
                 "seq": parse_info.get("seq", 0),
             })
-            tag_history[anchor_address] = [point for point in series if point["time"] >= cutoff]
+            while series and series[0]["time"] < cutoff:
+                series.popleft()
 
         for anchor_address in list(tag_history):
-            tag_history[anchor_address] = [point for point in tag_history[anchor_address] if point["time"] >= cutoff]
-            if not tag_history[anchor_address]:
+            series = tag_history[anchor_address]
+            while series and series[0]["time"] < cutoff:
+                series.popleft()
+            if not series:
                 tag_history.pop(anchor_address, None)
 
     def tag_color_index(self, tag):
@@ -354,11 +427,12 @@ class DebugPanelMixin:
         if not force and now - self.last_location_overlay_refresh < self.location_overlay_interval:
             return
         self.last_location_overlay_refresh = now
-        self.clear_measurement_overlay(tag)
 
         info = self.debug_parse_data.get(tag)
         if info and info.get("location_result") == 1:
             self.draw_location_measurement_overlay(info, self.tag_color_index(tag))
+        else:
+            self.clear_measurement_overlay(tag)
 
     def refresh_location_measurement_overlay(self):
         """Rebuild main-canvas measurement overlays for all live tags."""
@@ -392,6 +466,8 @@ class DebugPanelMixin:
                 "z": float(config["z"]),
             })
         if not anchors:
+            tag = int(info.get("tag", 0))
+            self.clear_measurement_overlay(tag)
             return
 
         tag = int(info.get("tag", 0))
@@ -421,44 +497,72 @@ class DebugPanelMixin:
             (-170, 26),
         ]
         label_dx, label_dy = label_offsets[tag_index % len(label_offsets)]
+        used_keys = set()
 
         for anchor in anchors:
             anchor_scene_x, anchor_scene_y = self.map_scene_point(anchor["x"], anchor["y"], anchor["z"])
             if self.measurement_aid_enabled:
                 radius = anchor["distance"] * self.ratio
-                circle = self.scene.addEllipse(
-                    anchor_scene_x - radius,
-                    anchor_scene_y - radius,
-                    radius * 2,
-                    radius * 2,
-                    circle_pen,
+                circle_key = ("circle", anchor["address"])
+                circle = self.get_measurement_overlay_item(
+                    tag,
+                    circle_key,
+                    lambda: self.scene.addEllipse(0, 0, 0, 0),
+                    -6,
                 )
-                self.add_measurement_overlay_item(circle, -6, tag)
+                circle.setRect(anchor_scene_x - radius, anchor_scene_y - radius, radius * 2, radius * 2)
+                circle.setPen(circle_pen)
+                circle.setBrush(QBrush(Qt.NoBrush))
+                used_keys.add(circle_key)
 
-                line = self.scene.addLine(anchor_scene_x, anchor_scene_y, tag_scene_x, tag_scene_y, line_pen)
-                self.add_measurement_overlay_item(line, 3, tag)
+                line_key = ("line", anchor["address"])
+                line = self.get_measurement_overlay_item(
+                    tag,
+                    line_key,
+                    lambda: self.scene.addLine(0, 0, 0, 0),
+                    3,
+                )
+                line.setLine(anchor_scene_x, anchor_scene_y, tag_scene_x, tag_scene_y)
+                line.setPen(line_pen)
+                used_keys.add(line_key)
 
                 mid_x = (anchor_scene_x + tag_scene_x) / 2
                 mid_y = (anchor_scene_y + tag_scene_y) / 2
-                distance_label = self.scene.addText("%0.2fm" % anchor["distance"])
+                label_key = ("distance_label", anchor["address"])
+                distance_label = self.get_measurement_overlay_item(
+                    tag,
+                    label_key,
+                    lambda: self.scene.addText(""),
+                    5,
+                )
+                distance_label.setPlainText("%0.2fm" % anchor["distance"])
                 distance_label.setFont(self.scene_label_font)
                 distance_label.setDefaultTextColor(label_color)
                 distance_label.setFlag(QtWidgets.QGraphicsItem.ItemIgnoresTransformations, True)
                 distance_label.setPos(mid_x + 6, mid_y - 18)
-                self.add_measurement_overlay_item(distance_label, 5, tag)
+                used_keys.add(label_key)
 
         marker = max(18, self.tag_marker_size + 2)
-        tag_marker = self.scene.addEllipse(
-            tag_scene_x - marker / 2,
-            tag_scene_y - marker / 2,
-            marker,
-            marker,
-            tag_pen,
-            QBrush(tag_color),
+        tag_marker_key = ("tag_marker", tag)
+        tag_marker = self.get_measurement_overlay_item(
+            tag,
+            tag_marker_key,
+            lambda: self.scene.addEllipse(0, 0, 0, 0),
+            8,
         )
-        self.add_measurement_overlay_item(tag_marker, 8, tag)
+        tag_marker.setRect(tag_scene_x - marker / 2, tag_scene_y - marker / 2, marker, marker)
+        tag_marker.setPen(tag_pen)
+        tag_marker.setBrush(QBrush(tag_color))
+        used_keys.add(tag_marker_key)
 
-        tag_label = self.scene.addText(
+        tag_label_key = ("tag_label", tag)
+        tag_label = self.get_measurement_overlay_item(
+            tag,
+            tag_label_key,
+            lambda: self.scene.addText(""),
+            9,
+        )
+        tag_label.setPlainText(
             "\u6807\u7b7e 0x%04X\n(%0.2f, %0.2f, %0.2f)" %
             (tag, tag_x, tag_y, tag_z)
         )
@@ -466,10 +570,16 @@ class DebugPanelMixin:
         tag_label.setDefaultTextColor(label_color)
         tag_label.setFlag(QtWidgets.QGraphicsItem.ItemIgnoresTransformations, True)
         tag_label.setPos(tag_scene_x + label_dx, tag_scene_y + label_dy)
-        self.add_measurement_overlay_item(tag_label, 9, tag)
+        used_keys.add(tag_label_key)
+        self.hide_unused_measurement_overlay_items(tag, used_keys)
 
     def update_debug_parse_result(self, parse_info):
         """Receive parsed packet data from TCP/COM services and refresh debug UI."""
+        if isinstance(parse_info, list):
+            for item in parse_info:
+                self.update_debug_parse_result(item)
+            return
+
         try:
             tag = int(parse_info.get("tag", 0))
         except (TypeError, ValueError):
@@ -479,17 +589,16 @@ class DebugPanelMixin:
 
         parse_info = dict(parse_info)
         now = time.time()
-        self.cleanup_debug_parse_data(now)
+        removed_tags = self.cleanup_debug_parse_data(now)
         parse_info["timestamp"] = now
         is_new_tag = tag not in self.debug_parse_data
         self.debug_parse_data[tag] = parse_info
         self.append_debug_distance_history(tag, parse_info, now)
         self.append_file_log(self.format_parse_log_text(parse_info))
         selected_tag = self.debug_tag_combo.currentData()
-        self.refresh_debug_tag_combo(preferred_tag=selected_tag if selected_tag is not None else tag)
-
-        if self.debug_parse_enabled and self.debug_tag_combo.currentData() == tag:
-            self.refresh_debug_parse_view()
+        tag_set_changed = bool(is_new_tag or removed_tags)
+        preferred_tag = selected_tag if selected_tag is not None else tag
+        self.mark_debug_parse_refresh(preferred_tag=preferred_tag, tag_set_changed=tag_set_changed)
         self.refresh_location_measurement_overlay_for_tag(tag, force=is_new_tag)
 
     def refresh_debug_tag_combo(self, preferred_tag=None):
@@ -498,9 +607,14 @@ class DebugPanelMixin:
         if current is None:
             current = self.debug_tag_combo.currentData()
 
+        tags = tuple(sorted(self.debug_parse_data))
+        if tags == getattr(self, "debug_tag_combo_tags", ()) and self.debug_tag_combo.findData(current) >= 0:
+            self.debug_tag_combo.setCurrentIndex(self.debug_tag_combo.findData(current))
+            return
+
         self.debug_tag_combo.blockSignals(True)
         self.debug_tag_combo.clear()
-        for tag in sorted(self.debug_parse_data):
+        for tag in tags:
             self.debug_tag_combo.addItem("0x%04X" % tag, tag)
 
         if self.debug_tag_combo.count() > 0:
@@ -509,10 +623,12 @@ class DebugPanelMixin:
                 index = 0
             self.debug_tag_combo.setCurrentIndex(index)
         self.debug_tag_combo.blockSignals(False)
+        self.debug_tag_combo_tags = tags
 
     def on_debug_tag_changed(self, index=None):
         """Refresh parsed views when the selected debug tag changes."""
         if self.debug_parse_enabled:
+            self.debug_parse_view_dirty = False
             self.refresh_debug_parse_view()
 
     def refresh_debug_parse_view(self):
@@ -579,8 +695,9 @@ class DebugPanelMixin:
         visible_series = {}
         all_distances = []
         for anchor_address in sorted(set(tag_history) | set(current_by_anchor)):
+            history_series = tag_history.get(anchor_address, [])
             series = [
-                point for point in tag_history.get(anchor_address, [])
+                point for point in history_series
                 if start_time <= float(point.get("time", 0.0)) <= now
             ]
             if not series and anchor_address in current_by_anchor:
@@ -592,7 +709,6 @@ class DebugPanelMixin:
                 }]
             if not series:
                 continue
-            series = sorted(series, key=lambda point: float(point.get("time", 0.0)))
             visible_series[anchor_address] = series
             all_distances.extend(float(point["distance"]) for point in series)
 

@@ -897,7 +897,7 @@ class UILayoutMixin:
             self.set_comm_status_style(self.label_port_state, "open")
             self.set_connection_status("TCP \u5df2\u8fde\u63a5 %s:%d" % (self.label_ip.text(), port))
 
-            self.gTag_Result = []
+            self.reset_tag_results()
             self.scene.clear()
             self.table_tag.clearContents()
             self.Display_Anthor(gAnthor_Node_Configure)
@@ -944,7 +944,7 @@ class UILayoutMixin:
             self.set_comm_status_style(self.com_status_label, "open")
             self.set_connection_status("COM \u5df2\u8fde\u63a5 %s @ %d" % (port, baudrate))
 
-            self.gTag_Result = []
+            self.reset_tag_results()
             self.scene.clear()
             self.table_tag.clearContents()
             self.Display_Anthor(gAnthor_Node_Configure)

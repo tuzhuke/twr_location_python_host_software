@@ -6,11 +6,12 @@ parsed packet details, location results, and algorithm status through Qt
 signals; UI widgets must not be touched directly from these worker threads.
 """
 import socket
+import time
 from threading import Thread
 
 from PyQt5 import QtCore
 
-from twr_main import Process_String_Before_Udp, extract_packets, twr_main
+from twr_main import Compute_Location, Process_String_Before_Udp, extract_packets
 from uwb_logging import get_logger
 
 try:
@@ -27,6 +28,98 @@ SERIAL_READ_TIMEOUT_S = 0.05
 SERIAL_READ_MAX_BYTES = 4096
 SERIAL_RX_BUFFER_SIZE = 8192
 SERIAL_TX_BUFFER_SIZE = 2048
+COMM_EMIT_INTERVAL_S = 0.03
+COMM_MAX_BATCH_PACKETS = 64
+COMM_MAX_RAW_CHARS = 32768
+
+
+class SignalBatcher:
+    """Coalesce high-rate transport events before crossing into the GUI thread."""
+
+    def __init__(self, owner):
+        self.owner = owner
+        self.raw_parts = []
+        self.raw_chars = 0
+        self.parse_infos = []
+        self.results_by_tag = {}
+        self.latest_algorithm = None
+        self.last_flush = time.monotonic()
+
+    def add_raw(self, text):
+        """Queue raw text/hex output for one receive chunk."""
+        if not text:
+            return
+        self.raw_parts.append(text)
+        self.raw_chars += len(text)
+
+    def add_packet(self, parse_info, location_tuple, algorithm):
+        """Queue parsed packet info and the latest located point per tag."""
+        self.latest_algorithm = algorithm
+        if parse_info is not None:
+            self.parse_infos.append(parse_info)
+
+        (
+            location_result,
+            location_seq,
+            location_addr,
+            location_x,
+            location_y,
+            location_z,
+            _algorithm,
+        ) = location_tuple
+        if location_result == 1:
+            self.results_by_tag[location_addr] = (
+                location_seq,
+                location_addr,
+                location_x,
+                location_y,
+                location_z,
+                algorithm,
+            )
+
+    def add_algorithm(self, algorithm):
+        """Queue a status-only algorithm update."""
+        self.latest_algorithm = algorithm
+
+    def should_flush(self, force=False):
+        """Return True when pending events should be emitted now."""
+        if force:
+            return True
+        pending_packets = len(self.parse_infos) + len(self.results_by_tag)
+        if pending_packets >= COMM_MAX_BATCH_PACKETS:
+            return True
+        if self.raw_chars >= COMM_MAX_RAW_CHARS:
+            return True
+        return time.monotonic() - self.last_flush >= COMM_EMIT_INTERVAL_S
+
+    def flush(self, force=False):
+        """Emit one compact batch of pending raw, parse, result, and status data."""
+        if not self.should_flush(force=force):
+            return
+
+        if self.raw_parts:
+            if any(part.startswith("HEX ") for part in self.raw_parts):
+                raw_text = "\n".join(self.raw_parts)
+            else:
+                raw_text = "".join(self.raw_parts)
+            self.owner.data_draf.emit(raw_text)
+
+        if self.latest_algorithm is not None:
+            self.owner.algorithm_status.emit(self.latest_algorithm)
+
+        if self.parse_infos:
+            self.owner.data_parse.emit(self.parse_infos[:] if len(self.parse_infos) > 1 else self.parse_infos[0])
+
+        if self.results_by_tag:
+            results = list(self.results_by_tag.values())
+            self.owner.data_result.emit(results if len(results) > 1 else results[0])
+
+        self.raw_parts = []
+        self.raw_chars = 0
+        self.parse_infos = []
+        self.results_by_tag = {}
+        self.latest_algorithm = None
+        self.last_flush = time.monotonic()
 
 
 class TCP_SERVER(QtCore.QThread):
@@ -87,7 +180,8 @@ class TCP_SERVER(QtCore.QThread):
         stop the whole client receiver.
         """
         logger.info("client connected: %s", info)
-        buffer = b""
+        buffer = bytearray()
+        batcher = SignalBatcher(self)
         try:
             client.settimeout(0.5)
             client.sendall("connect server successfully!".encode("utf8"))
@@ -95,27 +189,25 @@ class TCP_SERVER(QtCore.QThread):
                 try:
                     recv_bytes = client.recv(1024)
                 except socket.timeout:
+                    batcher.flush()
                     continue
                 if not recv_bytes:
                     break
 
-                self.data_draf.emit(self.format_raw_data(recv_bytes))
-                buffer += recv_bytes
+                batcher.add_raw(self.format_raw_data(recv_bytes))
+                buffer.extend(recv_bytes)
                 packets, buffer = self.extract_packets(buffer)
+                buffer = bytearray(buffer)
 
                 for packet in packets:
                     try:
                         parse_error, parse_info = Process_String_Before_Udp(packet)
-                        (
-                            location_result,
-                            location_seq,
-                            location_addr,
-                            location_x,
-                            location_y,
-                            location_z,
-                            algorithm,
-                        ) = twr_main(packet)
-                        self.algorithm_status.emit(algorithm)
+                        location_tuple = (
+                            Compute_Location(parse_info)
+                            if parse_error == 0
+                            else (0, 0, 0, 0, 0, 0, "\u7b49\u5f85\u6570\u636e")
+                        )
+                        location_result, _, _, location_x, location_y, location_z, algorithm = location_tuple
                         if parse_error == 0:
                             parse_info = dict(parse_info)
                             parse_info.update({
@@ -125,19 +217,19 @@ class TCP_SERVER(QtCore.QThread):
                                 "location_z": location_z,
                                 "algorithm": algorithm,
                             })
-                            self.data_parse.emit(parse_info)
-                        if location_result == 1:
-                            self.data_result.emit(
-                                (location_seq, location_addr, location_x, location_y, location_z, algorithm)
-                            )
+                            batcher.add_packet(parse_info, location_tuple, algorithm)
+                        else:
+                            batcher.add_algorithm(algorithm)
                     except Exception as exc:
                         logger.warning("Process TCP packet failed: %s", exc)
-                        self.algorithm_status.emit("\u6570\u636e\u5e27\u5904\u7406\u5931\u8d25")
+                        batcher.add_algorithm("\u6570\u636e\u5e27\u5904\u7406\u5931\u8d25")
                         continue
+                batcher.flush()
         except OSError as exc:
             if not self.socketClosed:
                 logger.warning("%s", exc)
         finally:
+            batcher.flush(force=True)
             try:
                 client.close()
             except OSError:
@@ -215,7 +307,8 @@ class SERIAL_SERVER(QtCore.QThread):
 
     def read_loop(self):
         """Read serial bytes, split packets, parse, locate, and emit UI signals."""
-        buffer = b""
+        buffer = bytearray()
+        batcher = SignalBatcher(self)
         self.status_message.emit("COM: %s 已打开" % self.port)
         try:
             while self.running and self.serial_port is not None and self.serial_port.is_open:
@@ -228,25 +321,23 @@ class SERIAL_SERVER(QtCore.QThread):
                     break
 
                 if not recv_bytes:
+                    batcher.flush()
                     continue
 
-                self.data_draf.emit(TCP_SERVER.format_raw_data(recv_bytes))
-                buffer += recv_bytes
+                batcher.add_raw(TCP_SERVER.format_raw_data(recv_bytes))
+                buffer.extend(recv_bytes)
                 packets, buffer = extract_packets(buffer)
+                buffer = bytearray(buffer)
 
                 for packet in packets:
                     try:
                         parse_error, parse_info = Process_String_Before_Udp(packet)
-                        (
-                            location_result,
-                            location_seq,
-                            location_addr,
-                            location_x,
-                            location_y,
-                            location_z,
-                            algorithm,
-                        ) = twr_main(packet)
-                        self.algorithm_status.emit(algorithm)
+                        location_tuple = (
+                            Compute_Location(parse_info)
+                            if parse_error == 0
+                            else (0, 0, 0, 0, 0, 0, "\u7b49\u5f85\u6570\u636e")
+                        )
+                        location_result, _, _, location_x, location_y, location_z, algorithm = location_tuple
                         if parse_error == 0:
                             parse_info = dict(parse_info)
                             parse_info.update({
@@ -256,16 +347,16 @@ class SERIAL_SERVER(QtCore.QThread):
                                 "location_z": location_z,
                                 "algorithm": algorithm,
                             })
-                            self.data_parse.emit(parse_info)
-                        if location_result == 1:
-                            self.data_result.emit(
-                                (location_seq, location_addr, location_x, location_y, location_z, algorithm)
-                            )
+                            batcher.add_packet(parse_info, location_tuple, algorithm)
+                        else:
+                            batcher.add_algorithm(algorithm)
                     except Exception as exc:
                         logger.warning("Process SERIAL packet failed: %s", exc)
-                        self.algorithm_status.emit("\u6570\u636e\u5e27\u5904\u7406\u5931\u8d25")
+                        batcher.add_algorithm("\u6570\u636e\u5e27\u5904\u7406\u5931\u8d25")
                         continue
+                batcher.flush()
         finally:
+            batcher.flush(force=True)
             self.serial_close()
             self.status_message.emit("COM: 未打开")
 
